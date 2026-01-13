@@ -1,0 +1,15 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Excel trackers (generated data)
+*.xlsx
