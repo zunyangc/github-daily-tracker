@@ -52,11 +52,49 @@ import time
 import datetime as dt
 import zipfile
 from typing import Tuple, Dict, Any, List, Set
+from pathlib import Path
 
 import requests
 from openpyxl import load_workbook
 
 API = "https://api.github.com"
+
+
+
+def load_dotenv(dotenv_path: str = ".env") -> Dict[str, str]:
+    """
+    Minimal .env loader.
+    Reads KEY=VALUE pairs, ignores blank lines and comments.
+    Supports quoted values.
+    """
+    path = Path(dotenv_path)
+    if not path.is_file():
+        die(f"Workbook not found: {path}. Put the .xlsx in this folder or run init_tracker.py.")
+
+    data: Dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+
+        # remove optional quotes
+        if (len(v) >= 2) and ((v[0] == v[-1]) and v[0] in ("'", '"')):
+            v = v[1:-1]
+
+        data[k] = v
+    return data
+
+
+def require_cfg(cfg: Dict[str, str], key: str) -> str:
+    v = cfg.get(key)
+    if not v:
+        die(f"Missing required config in .env: {key}")
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -90,27 +128,6 @@ def die(msg: str, code: int = 1) -> None:
     """
     log(f"ERROR: {msg}")
     sys.exit(code)
-
-
-# ---------------------------------------------------------------------------
-# Date/time utilities
-# ---------------------------------------------------------------------------
-
-def utc_iso(d: dt.datetime) -> str:
-    """
-    Convert a datetime to an ISO-8601 UTC string format required by GitHub APIs.
-
-    Input:
-        d: datetime (timezone-aware preferred). If naive, assumed UTC.
-
-    Output:
-        A string like "2026-01-13T00:00:00Z"
-    """
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=dt.UTC)
-    else:
-        d = d.astimezone(dt.UTC)
-    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def parse_args() -> dt.date:
@@ -306,43 +323,87 @@ def count_commits_pushed_to_repo_that_day(
     events: List[Dict[str, Any]],
     owner: str,
     repo: str,
-    day: dt.date
+    day: dt.date,
+    headers: Dict[str, str],
 ) -> int:
     """
     Count commits pushed to the target repo on the target day.
 
-    Definition (per your requirement):
-    - Deduplicate by SHA across multiple pushes the same day.
-    - Count all commits listed in PushEvent payloads for that repo/day.
+    - Events API PushEvent no longer includes payload.commits/counts (post Oct 2025 changes),
+      so we must use payload.before + payload.head to query commit data via REST.
+    - We count commits per push by calling:
+        GET /repos/{owner}/{repo}/compare/{before}...{head}
 
-    Inputs:
-        events: GitHub user events (from /users/{username}/events)
-        owner/repo: target repo
-        day: target date
-
-    Output:
-        int = number of new commit SHAs pushed to that repo on that day
+    Notes:
+    - Events timestamps are UTC; filtering uses UTC date.
+    - Dedup by push_id to avoid double-counting if the same event appears twice.
+    - Handles new-branch pushes where 'before' can be all zeros by deriving a base from default branch head.
     """
+
     target_repo = f"{owner}/{repo}"
-    shas = set()
+    total = 0
+    seen_push_ids: Set[int] = set()
+
+    # helper: GET repo default branch head sha (used for new branch case)
+    def get_default_branch_head_sha() -> str:
+        repo_url = f"{API}/repos/{owner}/{repo}"
+        r = request_get(repo_url, headers=headers)
+        default_branch = r.json().get("default_branch", "main")
+
+        # fetch latest commit SHA on default branch
+        commits_url = f"{API}/repos/{owner}/{repo}/commits"
+        r2 = request_get(commits_url, headers=headers, params={"sha": default_branch, "per_page": 1})
+        arr = r2.json()
+        if isinstance(arr, list) and arr:
+            return arr[0].get("sha")
+        return ""
+
+    default_base_sha = None
+    ZERO_SHA = "0" * 40
 
     for ev in events:
         if ev.get("type") != "PushEvent":
             continue
 
-        # Commit counting is done by GitHub event UTC date, not local timezone
         created_at = dt.datetime.strptime(ev["created_at"], "%Y-%m-%dT%H:%M:%SZ").date()
         if created_at != day:
             continue
 
-        if ev.get("repo", {}) .get("name") != target_repo:
+        if ev.get("repo", {}).get("name") != target_repo:
             continue
 
-        for c in ev.get("payload", {}).get("commits", []):
-            if c.get("sha"):
-                shas.add(c["sha"])
+        payload = ev.get("payload", {}) or {}
+        push_id = payload.get("push_id")
+        if isinstance(push_id, int):
+            if push_id in seen_push_ids:
+                continue
+            seen_push_ids.add(push_id)
 
-    return len(shas)
+        before = payload.get("before")
+        head = payload.get("head")
+
+        if not before or not head:
+            continue  # nothing to compare
+
+        # If this is a new ref/branch, GitHub sometimes uses before = 0000...0000
+        if before == ZERO_SHA:
+            if default_base_sha is None:
+                default_base_sha = get_default_branch_head_sha()
+            if default_base_sha:
+                before = default_base_sha
+            else:
+                # fallback: if we can't resolve base, count at least 1 (head)
+                total += 1
+                continue
+
+        compare_url = f"{API}/repos/{owner}/{repo}/compare/{before}...{head}"
+        resp = request_get(compare_url, headers=headers)
+        data = resp.json()
+
+        # Compare API returns total_commits + commits[] (commits[] can be truncated)
+        total += int(data.get("total_commits", 0))
+
+    return total
 
 
 def count_triage_and_resolved_from_events(events: List[Dict[str, Any]], day: dt.date) -> Tuple[int, int]:
@@ -422,7 +483,7 @@ def count_metrics(owner: str, repo: str, username: str, day: dt.date, headers: D
 
     # 3) Commits count (FIXED) using PushEvent commits for that repo/day
     log("Fetching commits count via PushEvent (counts commits pushed by you to the repo that day)...")
-    commits = count_commits_pushed_to_repo_that_day(events, owner, repo, day)
+    commits = count_commits_pushed_to_repo_that_day(events, owner, repo, day, headers)
 
     # 4) Open snapshot as-of that day
     log("Fetching open issues/PRs counts as-of target day...")
@@ -470,23 +531,6 @@ def find_or_create_row(ws, day: dt.date) -> int:
     ws.cell(r, 1).value = day
     ws.cell(r, 1).number_format = "DD/MM/YYYY"
     return r
-
-
-def pick_workbook_path() -> str:
-    """
-    Determine which workbook file path to use.
-
-    Priority:
-        1) TRACKER_XLSX environment variable (if set)
-        2) default "daily_contributions_tracker_auto.xlsx"
-
-    Output:
-        workbook file path (string)
-    """
-    env = os.getenv("TRACKER_XLSX")
-    if env:
-        return env
-    return "daily_contributions_tracker_auto.xlsx"
 
 
 def validate_xlsx(path: str) -> None:
@@ -540,11 +584,16 @@ def main() -> None:
     except Exception as e:
         die(str(e))
 
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        die("GITHUB_TOKEN environment variable not set. Create a .env file with GITHUB_TOKEN=... or export it.")
+    script_dir = Path(__file__).resolve().parent
+    env_cfg = load_dotenv(str(script_dir / ".env"))
 
-    xlsx = pick_workbook_path()
+    token = require_cfg(env_cfg, "GITHUB_TOKEN")
+    xlsx = require_cfg(env_cfg, "TRACKER_OUT")
+    owner = require_cfg(env_cfg, "GITHUB_OWNER")
+    repo = require_cfg(env_cfg, "GITHUB_REPO")
+    username = require_cfg(env_cfg, "GITHUB_USERNAME")
+    sheet_name = require_cfg(env_cfg, "TRACKER_SHEET")
+
     log(f"Using workbook: {os.path.abspath(xlsx)}")
     validate_xlsx(xlsx)
 
@@ -554,26 +603,19 @@ def main() -> None:
     except zipfile.BadZipFile:
         die(f"BadZipFile: {xlsx} is not a real .xlsx. Re-download the workbook and try again.")
 
-    cfg = wb["Config"] if "Config" in wb.sheetnames else None
+    if sheet_name not in wb.sheetnames:
+        die(f"Worksheet '{sheet_name}' not found in workbook. Did you run init_tracker.py?")
 
-    if cfg:
-        owner = cfg["B1"].value
-        repo = cfg["B2"].value
-        username = cfg["B3"].value
-    else:
-        owner = os.getenv("GITHUB_OWNER")
-        repo = os.getenv("GITHUB_REPO")
-        username = os.getenv("GITHUB_USERNAME")
+    # Optional: enforce init_tracker-created Config sheet exists
+    if "Config" not in wb.sheetnames:
+        die("Sheet 'Config' not found in workbook. Did you run init_tracker.py?")
 
-    if not (owner and repo and username):
-        die("owner/repo/username missing. Fill Config sheet (B1..B3) or set env vars.")
-
-    log(f"Target date: {day.strftime('%Y-%m-%d')} | Repo: {owner}/{repo} | User: {username}")
+    log(f"Target date: {day:%Y-%m-%d} | Repo: {owner}/{repo} | User: {username} | Sheet: {sheet_name}")
 
     headers = gh_headers(token)
     metrics = count_metrics(owner, repo, username, day, headers)
 
-    ws = wb["Ansible.Azcollection"] if "Ansible.Azcollection" in wb.sheetnames else wb.active
+    ws = wb[sheet_name]
     row = find_or_create_row(ws, day)
 
     log(f"Writing metrics into row {row}...")
@@ -593,9 +635,9 @@ def main() -> None:
     ws.cell(row, 7).value = metrics["open_issues"]
     ws.cell(row, 8).value = metrics["open_prs"]
 
-    # Update "Last Updated (UTC)" in Config without deprecated utcnow()
-    if cfg:
-        cfg["B5"].value = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+    # Update "Last Updated (UTC)" in Config
+    cfg_ws = wb["Config"]
+    cfg_ws["B5"].value = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%SZ")
 
     log("Saving workbook...")
     wb.save(xlsx)
