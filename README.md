@@ -53,6 +53,17 @@ All files must live in the **same directory**:
 ***
 
 ## Setup (step by step)
+### (Pre-requisites) Generate GitHub Personal Access Token
+```
+1. Go to GitHub
+2. Click on Profile -> Settings
+3. Click on Developer Settings
+4. Click on Personal access tokens -> Tokens (Classic)
+5. Click on Generate new token -> Generate new token (Classic)
+6. Give an unique name, select expiration durations
+7. Make sure the "repo" scope is checked
+8. Click on Generate token
+```
 
 ### 1️⃣ Clone the repository
 
