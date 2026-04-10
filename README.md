@@ -9,10 +9,10 @@ This tool **automatically updates an Excel workbook** with your **daily GitHub c
 For the selected repo and user:
 
 *   **Issues Triaged**  
-    Unique issues you commented on that day
+    Unique issues you commented on that day (via Issue Comments API, scoped to repo)
 
 *   **Issues Resolved**  
-    Issues you closed that day (from your GitHub events)
+    Issues you personally closed that day (via Search API + Issue Events verification)
 
 *   **PRs Created**  
     PRs you opened that day
@@ -21,10 +21,10 @@ For the selected repo and user:
     PRs you authored that were merged that day
 
 *   **Commits**  
-    Number of commits you pushed to the repo that day (via PushEvent + compare API)
+    Commits you authored in the repo that day (via Commits API)
 
 *   **Open Issues / Open PRs**  
-    Snapshot counts as of end‑of‑day
+    Snapshot counts as of end‑of‑day (via two Search API queries)
 
 ***
 
@@ -69,7 +69,7 @@ All files must live in the **same directory**:
 
 ```bash
 git clone <your-repo-url>
-cd azcollection-daily-tracker
+cd github-daily-tracker
 ```
 
 ***
@@ -97,7 +97,7 @@ Create a file named **`.env`** in the same folder as the scripts.
 
 ```env
 # GitHub Personal Access Token (PAT)
-# Required scopes: read access to repos and events
+# Required scopes: read access to repos
 GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Output Excel filename (created by init_tracker.py, updated by update_tracker.py)
@@ -112,7 +112,7 @@ GITHUB_OWNER="repo-owner"
 # GitHub repository name
 GITHUB_REPO="repo-name"
 
-# Your GitHub username (used to filter events and search results)
+# Your GitHub username (used to filter search results and commits)
 GITHUB_USERNAME="zunyangc"
 
 # Your local timezone (stored in Excel for reference)
@@ -171,10 +171,10 @@ python init_tracker.py
 
 ## Notes & limitations
 
-*   GitHub **User Events API** only exposes **recent activity**
-*   This tracker is designed for **daily / ongoing use**
-*   It is **not suitable** for reconstructing years of historical data
+*   All metrics use the **Search API** and **Commits API** (no Events API dependency)
+*   Works for **any date** — not limited by the 90‑day Events API window
 *   All GitHub timestamps are evaluated in **UTC**
+*   Search API has a **30 requests/minute** rate limit for authenticated users
 
 ***
 
