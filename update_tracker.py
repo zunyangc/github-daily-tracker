@@ -527,14 +527,17 @@ def find_or_create_row(ws, day: dt.date) -> int:
     Output:
         row index (int) where data should be written.
     """
+    last_data_row = 1  # header
     for r in range(2, ws.max_row + 1):
         v = ws.cell(r, 1).value
         if isinstance(v, dt.datetime):
             v = v.date()
-        if isinstance(v, dt.date) and v == day:
-            return r
+        if isinstance(v, dt.date):
+            if v == day:
+                return r
+            last_data_row = r
 
-    r = ws.max_row + 1
+    r = last_data_row + 1
     ws.cell(r, 1).value = day
     ws.cell(r, 1).number_format = "DD/MM/YYYY"
     return r
