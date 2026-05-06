@@ -34,13 +34,13 @@ cd ~/github-daily-tracker && ./run_update.sh 10/4/2026
    - Display as a details table.
 3. Ask user permission before writing to the Notes column. Never auto-write.
 4. User reviews and may add/modify information.
-5. Write to Notes column (column **K**, index **11**) in the Excel workbook.
+5. Write to Notes column (column **J**) in the Excel workbook.
 
 ## Excel Details
 
 - Workbook path: `<path-to-excel-workbook>`
 - Sheet: `<sheet-name>` (matches `TRACKER_SHEET` in `.env`)
-- Notes column: **K** (index 11) — column J is `Release`, do not write there
+- Notes column: **J**
 - Library: `openpyxl`
 
 ## Notes Format

@@ -256,8 +256,8 @@ When invoked, Copilot will:
    > runghtracker 10/4/2026
    ```
 
-> **Note**: The Notes column is **K** (index 11). Column J is `Release` and
-> must not be written to by automation.
+> **Note**: Make sure the Notes column index in `copilot-instructions.md`
+> matches your actual workbook layout.
 
 ***
 
