@@ -16,7 +16,6 @@ HEADERS: List[str] = [
     "Commits",
     "Open Issues",
     "Open PRs",
-    "ADO Tests",
     "Release",
     "Notes",
 ]
@@ -68,7 +67,7 @@ def style_header(ws) -> None:
 
     ws.freeze_panes = "A2"
 
-    widths = [12, 14, 15, 12, 12, 10, 12, 10, 14, 12, 60]
+    widths = [12, 14, 15, 12, 12, 10, 12, 10, 12, 60]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 

@@ -32,7 +32,6 @@ For the selected repo and user:
 
 These columns are **never touched** by the script:
 
-*   **ADO Tests**
 *   **Release**
 *   **Notes**
 
