@@ -117,8 +117,9 @@ GITHUB_REPO="repo-name"
 # Your GitHub username (used to filter search results and commits)
 GITHUB_USERNAME="zunyangc"
 
-# Your local timezone (stored in Excel for reference)
-# NOTE: GitHub APIs use UTC; this does not change query logic
+# Your local timezone (IANA name). The "day" window for all metrics is
+# interpreted in this timezone, then translated to UTC for API queries.
+# Default: UTC.
 TRACKER_TIMEZONE="Asia/Kuala_Lumpur"
 
 # ---------- Optional (sensible defaults applied if omitted) ----------
@@ -264,7 +265,7 @@ When invoked, Copilot will:
 
 *   All metrics use the **Search API**, **Issue Comments API**, **Issue Events API**, and **Commits API** (no Events firehose dependency)
 *   Works for **any date** — not limited by the 90‑day Events API window
-*   All GitHub timestamps are evaluated in **UTC**. `TRACKER_TIMEZONE` is stored for reference only — it does not shift the query window. Contributions near local midnight may land on an unexpected UTC tracker date.
+*   The "day" window is interpreted in your **`TRACKER_TIMEZONE`** (defaults to `UTC`). All API queries are translated to the corresponding UTC range, so contributions made near local midnight land on the expected tracker date. The default `parse_args` "today" also uses this timezone.
 *   `Open Issues` / `Open PRs` are an **approximation**: items that were closed on/before the target day, later reopened, and currently open will be miscounted.
 *   Search API has a **30 requests/minute** rate limit for authenticated users and a hard **1000-result** cap per query. The script logs a warning when a query exceeds this cap.
 *   `run_update.sh` automatically activates `./venv` if present, and uses `python3` (override with `PYTHON=...`).

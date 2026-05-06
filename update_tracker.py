@@ -47,6 +47,7 @@ import datetime as dt
 import zipfile
 from typing import Tuple, Dict, Any, List
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from openpyxl import load_workbook
@@ -54,6 +55,36 @@ from openpyxl import load_workbook
 DEFAULT_API = "https://api.github.com"
 DEFAULT_DATE_FORMAT = "DD/MM/YYYY"
 DEFAULT_MAX_PAGES = 10
+DEFAULT_TIMEZONE = "UTC"
+
+
+def resolve_tz(tz_name: str) -> ZoneInfo:
+    """Resolve a timezone name to a ZoneInfo, dying with a helpful message on failure."""
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        die(f"Unknown TRACKER_TIMEZONE '{tz_name}'. Use an IANA name like 'Asia/Kuala_Lumpur' or 'UTC'.")
+
+
+def day_bounds_utc(day: dt.date, tz: ZoneInfo) -> Tuple[dt.datetime, dt.datetime]:
+    """
+    Return [start_utc, end_utc) covering the local-day `day` in timezone `tz`.
+
+    The script treats a "day" as the user's local day. All API queries are
+    rewritten to use this UTC window so that contributions near local midnight
+    land on the expected tracker date.
+    """
+    start_local = dt.datetime.combine(day, dt.time.min, tzinfo=tz)
+    end_local = start_local + dt.timedelta(days=1)
+    return (
+        start_local.astimezone(dt.timezone.utc).replace(tzinfo=None),
+        end_local.astimezone(dt.timezone.utc).replace(tzinfo=None),
+    )
+
+
+def fmt_iso_z(t: dt.datetime) -> str:
+    """Format a naive UTC datetime as ISO-8601 with trailing Z (GitHub-friendly)."""
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def load_dotenv(dotenv_path: str = ".env") -> Dict[str, str]:
@@ -136,7 +167,7 @@ def die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
-def parse_args() -> dt.date:
+def parse_args(tz: ZoneInfo) -> dt.date:
     """
     Parse command-line date argument.
 
@@ -145,10 +176,10 @@ def parse_args() -> dt.date:
         - DD/MM/YYYY     e.g. 13/01/2026
         - DD/MM/YY       e.g. 13/01/26
 
-    If no argument is provided, defaults to *today* based on local machine date.
+    If no argument is provided, defaults to *today* in the user's TRACKER_TIMEZONE.
 
     Output:
-        A dt.date object for the target day.
+        A dt.date object representing the local target day.
     """
     if len(sys.argv) >= 2 and sys.argv[1].strip():
         s = sys.argv[1].strip()
@@ -159,7 +190,7 @@ def parse_args() -> dt.date:
             except Exception:
                 pass
         raise ValueError(f"Unsupported date format: {s}. Use YYYY-MM-DD or DD/MM/YYYY")
-    return dt.datetime.now().date()
+    return dt.datetime.now(tz).date()
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +310,7 @@ def search_count(query: str, headers: Dict[str, str], api_base: str) -> int:
     return total
 
 
-def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[str, str], api_base: str) -> Tuple[int, int]:
+def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[str, str], api_base: str, tz: ZoneInfo) -> Tuple[int, int]:
     """
     Compute open issues and open PRs snapshot "as-of end of target day".
 
@@ -300,24 +331,25 @@ def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[st
     Output:
         (open_issues_count, open_prs_count) as integers
     """
-    day_str = day.strftime("%Y-%m-%d")
+    _, end_utc = day_bounds_utc(day, tz)
+    end_iso = fmt_iso_z(end_utc)
 
     # Issues: still open + created on or before that day
     open_issues_now = search_count(
-        f"repo:{owner}/{repo} is:issue is:open created:<={day_str}", headers, api_base,
+        f"repo:{owner}/{repo} is:issue is:open created:<{end_iso}", headers, api_base,
     )
     # Issues: closed after that day (were open on that day) + created on or before
     closed_issues_after = search_count(
-        f"repo:{owner}/{repo} is:issue is:closed closed:>{day_str} created:<={day_str}", headers, api_base,
+        f"repo:{owner}/{repo} is:issue is:closed closed:>={end_iso} created:<{end_iso}", headers, api_base,
     )
 
     # PRs: still open + created on or before that day
     open_prs_now = search_count(
-        f"repo:{owner}/{repo} is:pr is:open created:<={day_str}", headers, api_base,
+        f"repo:{owner}/{repo} is:pr is:open created:<{end_iso}", headers, api_base,
     )
     # PRs: closed after that day + created on or before
     closed_prs_after = search_count(
-        f"repo:{owner}/{repo} is:pr is:closed closed:>{day_str} created:<={day_str}", headers, api_base,
+        f"repo:{owner}/{repo} is:pr is:closed closed:>={end_iso} created:<{end_iso}", headers, api_base,
     )
 
     return open_issues_now + closed_issues_after, open_prs_now + closed_prs_after
@@ -327,7 +359,7 @@ def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[st
 # GitHub metrics: Search API for triage/resolved, Commits API for commits
 # ---------------------------------------------------------------------------
 
-def count_issues_triaged(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, max_pages: int = DEFAULT_MAX_PAGES) -> int:
+def count_issues_triaged(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, tz: ZoneInfo, max_pages: int = DEFAULT_MAX_PAGES) -> int:
     """
     Count unique issues (not PRs) in the target repo where the user commented on that day.
 
@@ -347,9 +379,8 @@ def count_issues_triaged(owner: str, repo: str, username: str, day: dt.date, hea
     Output:
         Integer count of unique issues commented on.
     """
-    day_start = dt.datetime.combine(day, dt.time.min)
-    day_end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min)
-    since_str = day_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    day_start, day_end = day_bounds_utc(day, tz)
+    since_str = fmt_iso_z(day_start)
 
     url = f"{api_base}/repos/{owner}/{repo}/issues/comments"
     params: Dict[str, Any] = {"since": since_str, "sort": "created", "direction": "desc", "per_page": 100}
@@ -409,7 +440,7 @@ def count_issues_triaged(owner: str, repo: str, username: str, day: dt.date, hea
     return len(issue_numbers)
 
 
-def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, max_pages: int = DEFAULT_MAX_PAGES) -> int:
+def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, tz: ZoneInfo, max_pages: int = DEFAULT_MAX_PAGES) -> int:
     """
     Count issues the user closed on that day in the target repo.
 
@@ -429,12 +460,12 @@ def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, he
     Output:
         Integer count of issues the user closed.
     """
-    day_str = day.strftime("%Y-%m-%d")
-    day_start = dt.datetime.combine(day, dt.time.min)
-    day_end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min)
+    day_start, day_end = day_bounds_utc(day, tz)
+    start_iso = fmt_iso_z(day_start)
+    end_inclusive_iso = fmt_iso_z(day_end - dt.timedelta(seconds=1))
 
-    # Step 1: Find all issues closed on that day (paginated, capped by Search API at 1000)
-    query = f"repo:{owner}/{repo} is:issue is:closed closed:{day_str}"
+    # Step 1: Find all issues closed within the local day window (paginated, capped by Search API at 1000)
+    query = f"repo:{owner}/{repo} is:issue is:closed closed:{start_iso}..{end_inclusive_iso}"
     search_url: str | None = f"{api_base}/search/issues"
     search_params: Dict[str, Any] = {"q": query, "per_page": 100}
     items: List[Dict[str, Any]] = []
@@ -445,7 +476,7 @@ def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, he
         items.extend(payload.get("items", []))
         if pages == 0 and int(payload.get("total_count", 0)) > 1000:
             log(
-                f"WARNING: >1000 issues closed on {day_str}; Search API can only return the first 1000."
+                f"WARNING: >1000 issues closed in window {start_iso}..{end_inclusive_iso}; Search API can only return the first 1000."
             )
         if "next" in r.links:
             search_url = r.links["next"]["url"]
@@ -485,24 +516,20 @@ def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, he
     return count
 
 
-def count_commits(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, max_pages: int = DEFAULT_MAX_PAGES) -> int:
+def count_commits(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, tz: ZoneInfo, max_pages: int = DEFAULT_MAX_PAGES) -> int:
     """
-    Count commits authored by the user in the target repo on the given day.
+    Count commits authored by the user in the target repo on the given local day.
 
     Uses the Commits API: GET /repos/{owner}/{repo}/commits?author={user}&since=&until=
     This avoids all PushEvent/compare issues (force pushes, new branches, 90-day limit).
-
-    Input:
-        owner, repo: target repository
-        username: GitHub username
-        day: target date
-        headers: GitHub headers
+    The day window is computed in the user's TRACKER_TIMEZONE.
 
     Output:
         Integer count of commits.
     """
-    since = dt.datetime.combine(day, dt.time.min).strftime("%Y-%m-%dT%H:%M:%SZ")
-    until = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_utc, end_utc = day_bounds_utc(day, tz)
+    since = fmt_iso_z(start_utc)
+    until = fmt_iso_z(end_utc)
 
     commits_url = f"{api_base}/repos/{owner}/{repo}/commits"
     params = {
@@ -525,6 +552,7 @@ def count_metrics(
     username: str,
     day: dt.date,
     headers: Dict[str, str],
+    tz: ZoneInfo,
     api_base: str = DEFAULT_API,
     include_open_snapshot: bool = True,
     max_pages: int = DEFAULT_MAX_PAGES,
@@ -533,36 +561,35 @@ def count_metrics(
     Gather all metrics needed for one date row.
 
     All queries are scoped to the target repo via Search API or Commits API.
-
-    Input:
-        owner, repo: repository identifier
-        username: GitHub username
-        day: target date
-        headers: GitHub headers
+    The day window is computed in the user's TRACKER_TIMEZONE so contributions
+    near local midnight land on the expected tracker date.
 
     Output:
         dict:
             issues_triaged, issues_resolved, prs_created, prs_merged,
             commits, open_issues, open_prs
     """
-    day_str = day.strftime("%Y-%m-%d")
+    start_utc, end_utc = day_bounds_utc(day, tz)
+    start_iso = fmt_iso_z(start_utc)
+    end_inclusive_iso = fmt_iso_z(end_utc - dt.timedelta(seconds=1))
+    window = f"{start_iso}..{end_inclusive_iso}"
 
     # 1) PR counts via Search API
-    log("Fetching PR counts (created / merged) via search...")
-    prs_created = search_count(f"repo:{owner}/{repo} is:pr author:{username} created:{day_str}", headers, api_base)
-    prs_merged = search_count(f"repo:{owner}/{repo} is:pr author:{username} merged:{day_str}", headers, api_base)
+    log(f"Fetching PR counts (created / merged) via search [{window}]...")
+    prs_created = search_count(f"repo:{owner}/{repo} is:pr author:{username} created:{window}", headers, api_base)
+    prs_merged = search_count(f"repo:{owner}/{repo} is:pr author:{username} merged:{window}", headers, api_base)
 
-    # 2) Issues triaged (commented on) via Search API
+    # 2) Issues triaged (commented on) via Issue Comments API
     log("Fetching issues triaged (commented on) via search...")
-    issues_triaged = count_issues_triaged(owner, repo, username, day, headers, api_base, max_pages)
+    issues_triaged = count_issues_triaged(owner, repo, username, day, headers, api_base, tz, max_pages)
 
     # 3) Issues resolved (closed) via Search API
     log("Fetching issues resolved (closed) via search...")
-    issues_resolved = count_issues_resolved(owner, repo, username, day, headers, api_base, max_pages)
+    issues_resolved = count_issues_resolved(owner, repo, username, day, headers, api_base, tz, max_pages)
 
     # 4) Commits via Commits API
     log("Fetching commits count via Commits API...")
-    commits = count_commits(owner, repo, username, day, headers, api_base, max_pages)
+    commits = count_commits(owner, repo, username, day, headers, api_base, tz, max_pages)
 
     metrics: Dict[str, int] = {
         "issues_triaged": issues_triaged,
@@ -575,7 +602,7 @@ def count_metrics(
     # 5) Open snapshot as-of that day (optional — 4 extra search calls)
     if include_open_snapshot:
         log("Fetching open issues/PRs counts as-of target day...")
-        open_issues, open_prs = count_open_counts_asof(owner, repo, day, headers, api_base)
+        open_issues, open_prs = count_open_counts_asof(owner, repo, day, headers, api_base, tz)
         metrics["open_issues"] = open_issues
         metrics["open_prs"] = open_prs
     else:
@@ -671,11 +698,6 @@ def main() -> None:
     Output:
         None (prints logs, writes Excel)
     """
-    try:
-        day = parse_args()
-    except Exception as e:
-        die(str(e))
-
     script_dir = Path(__file__).resolve().parent
     env_cfg = load_dotenv(str(script_dir / ".env"))
 
@@ -690,12 +712,20 @@ def main() -> None:
     api_base = optional_cfg(env_cfg, "GITHUB_API_BASE_URL", DEFAULT_API).rstrip("/")
     date_format = optional_cfg(env_cfg, "TRACKER_DATE_FORMAT", DEFAULT_DATE_FORMAT)
     include_open_snapshot = truthy(optional_cfg(env_cfg, "TRACKER_INCLUDE_OPEN_SNAPSHOT", "true"))
+    tz_name = optional_cfg(env_cfg, "TRACKER_TIMEZONE", DEFAULT_TIMEZONE)
+    tz = resolve_tz(tz_name)
     try:
         max_pages = int(optional_cfg(env_cfg, "TRACKER_MAX_PAGES", str(DEFAULT_MAX_PAGES)))
         if max_pages < 1:
             raise ValueError
     except ValueError:
         die("TRACKER_MAX_PAGES must be a positive integer.")
+
+    # parse the date arg using the resolved timezone for the "today" default
+    try:
+        day = parse_args(tz)
+    except Exception as e:
+        die(str(e))
 
     # Resolve relative TRACKER_OUT against the script directory so the tool
     # works regardless of the current working directory.
@@ -720,11 +750,11 @@ def main() -> None:
     if "Config" not in wb.sheetnames:
         die("Sheet 'Config' not found in workbook. Did you run init_tracker.py?")
 
-    log(f"Target date: {day:%Y-%m-%d} | Repo: {owner}/{repo} | User: {username} | Sheet: {sheet_name} | API: {api_base}")
+    log(f"Target date: {day:%Y-%m-%d} | TZ: {tz_name} | Repo: {owner}/{repo} | User: {username} | Sheet: {sheet_name} | API: {api_base}")
 
     headers = gh_headers(token)
     metrics = count_metrics(
-        owner, repo, username, day, headers,
+        owner, repo, username, day, headers, tz,
         api_base=api_base,
         include_open_snapshot=include_open_snapshot,
         max_pages=max_pages,
