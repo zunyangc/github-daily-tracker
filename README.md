@@ -53,6 +53,9 @@ All files must live in the **same directory**:
 ***
 
 ## Setup (step by step)
+
+> **Requires Python 3.10+.**
+
 ### (Pre-requisites) Generate GitHub Personal Access Token
 ```
 1. Go to GitHub
@@ -118,6 +121,25 @@ GITHUB_USERNAME="zunyangc"
 # Your local timezone (stored in Excel for reference)
 # NOTE: GitHub APIs use UTC; this does not change query logic
 TRACKER_TIMEZONE="Asia/Kuala_Lumpur"
+
+# ---------- Optional (sensible defaults applied if omitted) ----------
+
+# GitHub API base URL. Set this to use GitHub Enterprise Server.
+# Default: https://api.github.com
+# GHES example: https://github.example.com/api/v3
+# GITHUB_API_BASE_URL="https://api.github.com"
+
+# Excel display format for the Date column. Default: DD/MM/YYYY
+# Examples: "YYYY-MM-DD", "MM/DD/YYYY", "DD-MMM-YYYY"
+# TRACKER_DATE_FORMAT="DD/MM/YYYY"
+
+# Whether to compute the "Open Issues / Open PRs" snapshot (4 extra Search
+# API calls per run). Set "false" to skip and save quota. Default: true
+# TRACKER_INCLUDE_OPEN_SNAPSHOT="true"
+
+# Maximum pages to walk for paginated endpoints (commits, issue comments,
+# search, issue events). Default: 10. Increase for very busy repos.
+# TRACKER_MAX_PAGES="10"
 ```
 
 ⚠️ **Important rules**
@@ -133,8 +155,15 @@ TRACKER_TIMEZONE="Asia/Kuala_Lumpur"
 This creates the Excel workbook, headers, and Config sheet.
 
 ```bash
-python init_tracker.py
+python3 init_tracker.py
 ```
+
+> If a workbook with the same name already exists the script will refuse to
+> overwrite it. Pass `--force` to replace it (this discards existing data):
+>
+> ```bash
+> python3 init_tracker.py --force
+> ```
 
 ✅ Result:
 
@@ -171,10 +200,12 @@ python init_tracker.py
 
 ## Notes & limitations
 
-*   All metrics use the **Search API** and **Commits API** (no Events API dependency)
+*   All metrics use the **Search API**, **Issue Comments API**, **Issue Events API**, and **Commits API** (no Events firehose dependency)
 *   Works for **any date** — not limited by the 90‑day Events API window
-*   All GitHub timestamps are evaluated in **UTC**
-*   Search API has a **30 requests/minute** rate limit for authenticated users
+*   All GitHub timestamps are evaluated in **UTC**. `TRACKER_TIMEZONE` is stored for reference only — it does not shift the query window. Contributions near local midnight may land on an unexpected UTC tracker date.
+*   `Open Issues` / `Open PRs` are an **approximation**: items that were closed on/before the target day, later reopened, and currently open will be miscounted.
+*   Search API has a **30 requests/minute** rate limit for authenticated users and a hard **1000-result** cap per query. The script logs a warning when a query exceeds this cap.
+*   `run_update.sh` automatically activates `./venv` if present, and uses `python3` (override with `PYTHON=...`).
 
 ***
 

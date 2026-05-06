@@ -85,6 +85,19 @@ def main() -> None:
     username = require(cfg, "GITHUB_USERNAME")
     timezone = require(cfg, "TRACKER_TIMEZONE")
 
+    # Resolve relative TRACKER_OUT against the script directory.
+    out_path = Path(out)
+    if not out_path.is_absolute():
+        out_path = script_dir / out_path
+
+    # Don't silently overwrite an existing tracker — pass --force to replace.
+    force = "--force" in sys.argv[1:]
+    if out_path.exists() and not force:
+        die(
+            f"Workbook already exists: {out_path}. "
+            f"Refusing to overwrite. Pass --force to replace it (this will lose existing data)."
+        )
+
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_name
@@ -107,8 +120,8 @@ def main() -> None:
     config_ws.column_dimensions["A"].width = 22
     config_ws.column_dimensions["B"].width = 28
 
-    wb.save(out)
-    print(f"[init_tracker] Created workbook: {out}")
+    wb.save(str(out_path))
+    print(f"[init_tracker] Created workbook: {out_path}")
 
 
 if __name__ == "__main__":

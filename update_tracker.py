@@ -51,8 +51,9 @@ from pathlib import Path
 import requests
 from openpyxl import load_workbook
 
-API = "https://api.github.com"
-
+DEFAULT_API = "https://api.github.com"
+DEFAULT_DATE_FORMAT = "DD/MM/YYYY"
+DEFAULT_MAX_PAGES = 10
 
 
 def load_dotenv(dotenv_path: str = ".env") -> Dict[str, str]:
@@ -89,6 +90,17 @@ def require_cfg(cfg: Dict[str, str], key: str) -> str:
     if not v:
         die(f"Missing required config in .env: {key}")
     return v
+
+
+def optional_cfg(cfg: Dict[str, str], key: str, default: str) -> str:
+    v = cfg.get(key)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip()
+
+
+def truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -240,24 +252,34 @@ def get_all_pages(url: str, headers: Dict[str, str], params=None, max_pages: int
 # GitHub metrics: Search API counts
 # ---------------------------------------------------------------------------
 
-def search_count(query: str, headers: Dict[str, str]) -> int:
+def search_count(query: str, headers: Dict[str, str], api_base: str) -> int:
     """
     Run a GitHub Search API query and return total_count.
 
     Input:
         query: search query string, e.g. "repo:org/repo is:pr author:me created:2026-01-13"
         headers: GitHub headers
+        api_base: GitHub API base URL (api.github.com or GHES /api/v3)
 
     Output:
         Integer total_count returned by GitHub.
+
+    Note:
+        GitHub Search API caps results at 1000. If total_count exceeds 1000, this
+        value is still reported but a warning is logged because pagination can
+        only access the first 1000 items.
     """
-    url = f"{API}/search/issues"
+    url = f"{api_base}/search/issues"
     params = {"q": query, "per_page": 1}
     r = request_get(url, headers=headers, params=params)
-    return int(r.json().get("total_count", 0))
+    payload = r.json()
+    total = int(payload.get("total_count", 0))
+    if total > 1000:
+        log(f"WARNING: Search query exceeded 1000 results ({total}); some results may be inaccessible. Query: {query}")
+    return total
 
 
-def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[str, str]) -> Tuple[int, int]:
+def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[str, str], api_base: str) -> Tuple[int, int]:
     """
     Compute open issues and open PRs snapshot "as-of end of target day".
 
@@ -265,6 +287,10 @@ def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[st
         Query A: created<=day AND still open now  (lower bound — may undercount if closed later)
         Query B: created<=day AND closed AFTER day (were open on that day but closed since)
         Total = A + B
+
+    NOTE: This is an APPROXIMATION. Items closed before/on `day` and later
+    reopened (and currently open) will be incorrectly counted in Query A.
+    Exact reconstruction would require event/timeline traversal per item.
 
     Input:
         owner, repo: target repo
@@ -278,20 +304,20 @@ def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[st
 
     # Issues: still open + created on or before that day
     open_issues_now = search_count(
-        f"repo:{owner}/{repo} is:issue is:open created:<={day_str}", headers
+        f"repo:{owner}/{repo} is:issue is:open created:<={day_str}", headers, api_base,
     )
     # Issues: closed after that day (were open on that day) + created on or before
     closed_issues_after = search_count(
-        f"repo:{owner}/{repo} is:issue is:closed closed:>{day_str} created:<={day_str}", headers
+        f"repo:{owner}/{repo} is:issue is:closed closed:>{day_str} created:<={day_str}", headers, api_base,
     )
 
     # PRs: still open + created on or before that day
     open_prs_now = search_count(
-        f"repo:{owner}/{repo} is:pr is:open created:<={day_str}", headers
+        f"repo:{owner}/{repo} is:pr is:open created:<={day_str}", headers, api_base,
     )
     # PRs: closed after that day + created on or before
     closed_prs_after = search_count(
-        f"repo:{owner}/{repo} is:pr is:closed closed:>{day_str} created:<={day_str}", headers
+        f"repo:{owner}/{repo} is:pr is:closed closed:>{day_str} created:<={day_str}", headers, api_base,
     )
 
     return open_issues_now + closed_issues_after, open_prs_now + closed_prs_after
@@ -301,7 +327,7 @@ def count_open_counts_asof(owner: str, repo: str, day: dt.date, headers: Dict[st
 # GitHub metrics: Search API for triage/resolved, Commits API for commits
 # ---------------------------------------------------------------------------
 
-def count_issues_triaged(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str]) -> int:
+def count_issues_triaged(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, max_pages: int = DEFAULT_MAX_PAGES) -> int:
     """
     Count unique issues (not PRs) in the target repo where the user commented on that day.
 
@@ -325,17 +351,21 @@ def count_issues_triaged(owner: str, repo: str, username: str, day: dt.date, hea
     day_end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min)
     since_str = day_start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    url = f"{API}/repos/{owner}/{repo}/issues/comments"
+    url = f"{api_base}/repos/{owner}/{repo}/issues/comments"
     params: Dict[str, Any] = {"since": since_str, "sort": "created", "direction": "desc", "per_page": 100}
 
     issue_numbers: set = set()
     page_url: str | None = url
     page_params = params
 
-    for _ in range(10):  # max pages safety
+    pages_seen = 0
+    reached_day_start = False
+    for _ in range(max_pages):
+        pages_seen += 1
         r = request_get(page_url, headers, params=page_params)
         comments = r.json()
         if not comments:
+            reached_day_start = True
             break
 
         done = False
@@ -360,17 +390,26 @@ def count_issues_triaged(owner: str, repo: str, username: str, day: dt.date, hea
                 pass
 
         if done:
+            reached_day_start = True
             break
         if "next" in r.links:
             page_url = r.links["next"]["url"]
             page_params = None
         else:
+            reached_day_start = True
             break
+
+    if not reached_day_start:
+        log(
+            f"WARNING: count_issues_triaged hit max_pages={max_pages} ({pages_seen} pages fetched) "
+            f"without reaching day_start={day_start.isoformat()}. Result may be undercounted. "
+            f"Increase TRACKER_MAX_PAGES if needed."
+        )
 
     return len(issue_numbers)
 
 
-def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str]) -> int:
+def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, max_pages: int = DEFAULT_MAX_PAGES) -> int:
     """
     Count issues the user closed on that day in the target repo.
 
@@ -394,20 +433,44 @@ def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, he
     day_start = dt.datetime.combine(day, dt.time.min)
     day_end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min)
 
-    # Step 1: Find all issues closed on that day
+    # Step 1: Find all issues closed on that day (paginated, capped by Search API at 1000)
     query = f"repo:{owner}/{repo} is:issue is:closed closed:{day_str}"
-    url = f"{API}/search/issues"
-    params: Dict[str, Any] = {"q": query, "per_page": 100}
-    r = request_get(url, headers, params=params)
-    items = r.json().get("items", [])
+    search_url: str | None = f"{api_base}/search/issues"
+    search_params: Dict[str, Any] = {"q": query, "per_page": 100}
+    items: List[Dict[str, Any]] = []
+    pages = 0
+    while search_url and pages < max_pages:
+        r = request_get(search_url, headers, params=search_params)
+        payload = r.json()
+        items.extend(payload.get("items", []))
+        if pages == 0 and int(payload.get("total_count", 0)) > 1000:
+            log(
+                f"WARNING: >1000 issues closed on {day_str}; Search API can only return the first 1000."
+            )
+        if "next" in r.links:
+            search_url = r.links["next"]["url"]
+            search_params = None
+        else:
+            search_url = None
+        pages += 1
 
-    # Step 2: For each closed issue, check who closed it
+    # Step 2: For each closed issue, check who closed it (paginate events)
     count = 0
     for issue in items:
         number = issue["number"]
-        events_url = f"{API}/repos/{owner}/{repo}/issues/{number}/events"
-        ev_r = request_get(events_url, headers, params={"per_page": 100})
-        events = ev_r.json()
+        events_url: str | None = f"{api_base}/repos/{owner}/{repo}/issues/{number}/events"
+        events_params: Dict[str, Any] = {"per_page": 100}
+        events: List[Dict[str, Any]] = []
+        ev_pages = 0
+        while events_url and ev_pages < max_pages:
+            ev_r = request_get(events_url, headers, params=events_params)
+            events.extend(ev_r.json())
+            if "next" in ev_r.links:
+                events_url = ev_r.links["next"]["url"]
+                events_params = None
+            else:
+                events_url = None
+            ev_pages += 1
 
         # Walk events in reverse to find the most recent "closed" event on that day
         for ev in reversed(events):
@@ -422,7 +485,7 @@ def count_issues_resolved(owner: str, repo: str, username: str, day: dt.date, he
     return count
 
 
-def count_commits(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str]) -> int:
+def count_commits(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str], api_base: str, max_pages: int = DEFAULT_MAX_PAGES) -> int:
     """
     Count commits authored by the user in the target repo on the given day.
 
@@ -441,14 +504,14 @@ def count_commits(owner: str, repo: str, username: str, day: dt.date, headers: D
     since = dt.datetime.combine(day, dt.time.min).strftime("%Y-%m-%dT%H:%M:%SZ")
     until = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    commits_url = f"{API}/repos/{owner}/{repo}/commits"
+    commits_url = f"{api_base}/repos/{owner}/{repo}/commits"
     params = {
         "author": username,
         "since": since,
         "until": until,
         "per_page": 100,
     }
-    commits = get_all_pages(commits_url, headers, params=params, max_pages=10)
+    commits = get_all_pages(commits_url, headers, params=params, max_pages=max_pages)
     return len(commits)
 
 
@@ -456,7 +519,16 @@ def count_commits(owner: str, repo: str, username: str, day: dt.date, headers: D
 # Aggregate daily metrics
 # ---------------------------------------------------------------------------
 
-def count_metrics(owner: str, repo: str, username: str, day: dt.date, headers: Dict[str, str]) -> Dict[str, int]:
+def count_metrics(
+    owner: str,
+    repo: str,
+    username: str,
+    day: dt.date,
+    headers: Dict[str, str],
+    api_base: str = DEFAULT_API,
+    include_open_snapshot: bool = True,
+    max_pages: int = DEFAULT_MAX_PAGES,
+) -> Dict[str, int]:
     """
     Gather all metrics needed for one date row.
 
@@ -477,43 +549,51 @@ def count_metrics(owner: str, repo: str, username: str, day: dt.date, headers: D
 
     # 1) PR counts via Search API
     log("Fetching PR counts (created / merged) via search...")
-    prs_created = search_count(f"repo:{owner}/{repo} is:pr author:{username} created:{day_str}", headers)
-    prs_merged = search_count(f"repo:{owner}/{repo} is:pr author:{username} merged:{day_str}", headers)
+    prs_created = search_count(f"repo:{owner}/{repo} is:pr author:{username} created:{day_str}", headers, api_base)
+    prs_merged = search_count(f"repo:{owner}/{repo} is:pr author:{username} merged:{day_str}", headers, api_base)
 
     # 2) Issues triaged (commented on) via Search API
     log("Fetching issues triaged (commented on) via search...")
-    issues_triaged = count_issues_triaged(owner, repo, username, day, headers)
+    issues_triaged = count_issues_triaged(owner, repo, username, day, headers, api_base, max_pages)
 
     # 3) Issues resolved (closed) via Search API
     log("Fetching issues resolved (closed) via search...")
-    issues_resolved = count_issues_resolved(owner, repo, username, day, headers)
+    issues_resolved = count_issues_resolved(owner, repo, username, day, headers, api_base, max_pages)
 
     # 4) Commits via Commits API
     log("Fetching commits count via Commits API...")
-    commits = count_commits(owner, repo, username, day, headers)
+    commits = count_commits(owner, repo, username, day, headers, api_base, max_pages)
 
-    # 5) Open snapshot as-of that day (two-query approach)
-    log("Fetching open issues/PRs counts as-of target day...")
-    open_issues, open_prs = count_open_counts_asof(owner, repo, day, headers)
-
-    return {
+    metrics: Dict[str, int] = {
         "issues_triaged": issues_triaged,
         "issues_resolved": issues_resolved,
         "prs_created": prs_created,
         "prs_merged": prs_merged,
         "commits": commits,
-        "open_issues": open_issues,
-        "open_prs": open_prs,
     }
+
+    # 5) Open snapshot as-of that day (optional — 4 extra search calls)
+    if include_open_snapshot:
+        log("Fetching open issues/PRs counts as-of target day...")
+        open_issues, open_prs = count_open_counts_asof(owner, repo, day, headers, api_base)
+        metrics["open_issues"] = open_issues
+        metrics["open_prs"] = open_prs
+    else:
+        log("Skipping open issues/PRs snapshot (TRACKER_INCLUDE_OPEN_SNAPSHOT=false).")
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------
 # Excel helpers
 # ---------------------------------------------------------------------------
 
-def find_or_create_row(ws, day: dt.date) -> int:
+def find_or_create_row(ws, day: dt.date, date_format: str = DEFAULT_DATE_FORMAT) -> int:
     """
     Find an existing row whose Date column equals 'day', otherwise append a new row.
+
+    Always (re)applies the requested Excel number format to the Date cell, so
+    changing TRACKER_DATE_FORMAT also updates already-existing rows.
 
     Assumes:
         Column A is Date
@@ -523,6 +603,7 @@ def find_or_create_row(ws, day: dt.date) -> int:
     Input:
         ws: openpyxl worksheet
         day: target date
+        date_format: Excel number format for the Date cell (e.g., "DD/MM/YYYY")
 
     Output:
         row index (int) where data should be written.
@@ -534,12 +615,13 @@ def find_or_create_row(ws, day: dt.date) -> int:
             v = v.date()
         if isinstance(v, dt.date):
             if v == day:
+                ws.cell(r, 1).number_format = date_format
                 return r
             last_data_row = r
 
     r = last_data_row + 1
     ws.cell(r, 1).value = day
-    ws.cell(r, 1).number_format = "DD/MM/YYYY"
+    ws.cell(r, 1).number_format = date_format
     return r
 
 
@@ -604,6 +686,24 @@ def main() -> None:
     username = require_cfg(env_cfg, "GITHUB_USERNAME")
     sheet_name = require_cfg(env_cfg, "TRACKER_SHEET")
 
+    # Optional, customizable settings
+    api_base = optional_cfg(env_cfg, "GITHUB_API_BASE_URL", DEFAULT_API).rstrip("/")
+    date_format = optional_cfg(env_cfg, "TRACKER_DATE_FORMAT", DEFAULT_DATE_FORMAT)
+    include_open_snapshot = truthy(optional_cfg(env_cfg, "TRACKER_INCLUDE_OPEN_SNAPSHOT", "true"))
+    try:
+        max_pages = int(optional_cfg(env_cfg, "TRACKER_MAX_PAGES", str(DEFAULT_MAX_PAGES)))
+        if max_pages < 1:
+            raise ValueError
+    except ValueError:
+        die("TRACKER_MAX_PAGES must be a positive integer.")
+
+    # Resolve relative TRACKER_OUT against the script directory so the tool
+    # works regardless of the current working directory.
+    xlsx_path = Path(xlsx)
+    if not xlsx_path.is_absolute():
+        xlsx_path = script_dir / xlsx_path
+    xlsx = str(xlsx_path)
+
     log(f"Using workbook: {os.path.abspath(xlsx)}")
     validate_xlsx(xlsx)
 
@@ -620,13 +720,18 @@ def main() -> None:
     if "Config" not in wb.sheetnames:
         die("Sheet 'Config' not found in workbook. Did you run init_tracker.py?")
 
-    log(f"Target date: {day:%Y-%m-%d} | Repo: {owner}/{repo} | User: {username} | Sheet: {sheet_name}")
+    log(f"Target date: {day:%Y-%m-%d} | Repo: {owner}/{repo} | User: {username} | Sheet: {sheet_name} | API: {api_base}")
 
     headers = gh_headers(token)
-    metrics = count_metrics(owner, repo, username, day, headers)
+    metrics = count_metrics(
+        owner, repo, username, day, headers,
+        api_base=api_base,
+        include_open_snapshot=include_open_snapshot,
+        max_pages=max_pages,
+    )
 
     ws = wb[sheet_name]
-    row = find_or_create_row(ws, day)
+    row = find_or_create_row(ws, day, date_format)
 
     log(f"Writing metrics into row {row}...")
     # A Date
@@ -642,12 +747,14 @@ def main() -> None:
     ws.cell(row, 4).value = metrics["prs_created"]
     ws.cell(row, 5).value = metrics["prs_merged"]
     ws.cell(row, 6).value = metrics["commits"]
-    ws.cell(row, 7).value = metrics["open_issues"]
-    ws.cell(row, 8).value = metrics["open_prs"]
+    if "open_issues" in metrics:
+        ws.cell(row, 7).value = metrics["open_issues"]
+    if "open_prs" in metrics:
+        ws.cell(row, 8).value = metrics["open_prs"]
 
     # Update "Last Updated (UTC)" in Config
     cfg_ws = wb["Config"]
-    cfg_ws["B5"].value = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+    cfg_ws["B5"].value = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
     log("Saving workbook...")
     wb.save(xlsx)
