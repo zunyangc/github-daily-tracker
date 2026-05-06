@@ -198,6 +198,69 @@ python3 init_tracker.py
 
 ***
 
+## Optional: One-shot run via GitHub Copilot CLI
+
+If you use [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli),
+this repo ships a `copilot-instructions.md` template that lets you trigger the
+full daily workflow with a single command (e.g. `runghtracker`) inside `copilot`.
+
+### What it does
+
+When invoked, Copilot will:
+
+1. Run `./run_update.sh` (optionally with a date) and show the metrics table.
+2. Use `gh` CLI to fetch the day's PRs created/merged, issues closed, issues
+   commented on, and PRs in progress.
+3. Ask before writing anything, then write a summary to the **Notes** column.
+
+### Setup
+
+1. **Install GitHub CLI** and authenticate (used by Copilot to fetch activity):
+
+   ```bash
+   gh auth login
+   ```
+
+2. **Install the instructions** so Copilot CLI auto-loads them.
+   Pick one of the supported locations
+   (see `copilot /instructions` for the full list):
+
+   ```bash
+   # Personal (recommended) — applies anywhere you run `copilot`
+   mkdir -p ~/.copilot
+   cp copilot-instructions.md ~/.copilot/copilot-instructions.md
+
+   # OR repo-scoped — only loads when you run `copilot` inside this repo
+   mkdir -p .github
+   cp copilot-instructions.md .github/copilot-instructions.md
+   ```
+
+3. **Edit the copy** and replace the placeholders with your own values:
+
+   | Placeholder                | Replace with                                 |
+   |----------------------------|----------------------------------------------|
+   | `<owner>/<repo>`           | `GITHUB_OWNER/GITHUB_REPO` from `.env`       |
+   | `<github-username>`        | `GITHUB_USERNAME` from `.env`                |
+   | `<path-to-excel-workbook>` | absolute path to your `TRACKER_OUT` file     |
+   | `<sheet-name>`             | `TRACKER_SHEET` from `.env`                  |
+
+   If you cloned this repo somewhere other than `~/github-daily-tracker`,
+   update the `cd` path in the **Tracker Script** section too.
+
+4. **Reload Copilot CLI** and try it:
+
+   ```bash
+   copilot
+   > runghtracker
+   # or with a specific date
+   > runghtracker 10/4/2026
+   ```
+
+> **Note**: The Notes column is **K** (index 11). Column J is `Release` and
+> must not be written to by automation.
+
+***
+
 ## Notes & limitations
 
 *   All metrics use the **Search API**, **Issue Comments API**, **Issue Events API**, and **Commits API** (no Events firehose dependency)
