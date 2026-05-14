@@ -27,9 +27,18 @@ What this script updates in Excel (auto-populated)
     Snapshot count approximated by summing two queries:
       (1) created<=day AND still open  (2) created<=day AND closed after day
 
-Manual columns (not overwritten)
--------------------------------
-- ADO Tests, Release, Notes
+Column layout (data sheet)
+--------------------------
+- A Date            (written + format normalized every run)
+- B Issues Triaged  (written)
+- C Issues Resolved (written)
+- D PRs Created     (written)
+- E PRs Merged      (written)
+- F Commits         (written)
+- G Open Issues     (written)
+- H Open PRs        (written)
+- I Release         (manual — NEVER touched)
+- J Notes           (manual — NEVER touched)
 
 Defaults
 --------
@@ -53,7 +62,7 @@ import requests
 from openpyxl import load_workbook
 
 DEFAULT_API = "https://api.github.com"
-DEFAULT_DATE_FORMAT = "DD/MM/YYYY"
+DEFAULT_DATE_FORMAT = "dd/mm/yyyy"
 DEFAULT_MAX_PAGES = 10
 DEFAULT_TIMEZONE = "UTC"
 
@@ -619,8 +628,10 @@ def find_or_create_row(ws, day: dt.date, date_format: str = DEFAULT_DATE_FORMAT)
     """
     Find an existing row whose Date column equals 'day', otherwise append a new row.
 
-    Always (re)applies the requested Excel number format to the Date cell, so
-    changing TRACKER_DATE_FORMAT also updates already-existing rows.
+    Side effect: normalizes the Excel number format on EVERY Date cell in the
+    sheet so the whole column stays consistent (fixes drift when Excel
+    occasionally re-applies a locale-default format like 'mm-dd-yy' to recently
+    written rows).
 
     Assumes:
         Column A is Date
@@ -630,21 +641,27 @@ def find_or_create_row(ws, day: dt.date, date_format: str = DEFAULT_DATE_FORMAT)
     Input:
         ws: openpyxl worksheet
         day: target date
-        date_format: Excel number format for the Date cell (e.g., "DD/MM/YYYY")
+        date_format: Excel number format for the Date cell (e.g., "dd/mm/yyyy")
 
     Output:
         row index (int) where data should be written.
     """
+    match_row = None
     last_data_row = 1  # header
     for r in range(2, ws.max_row + 1):
-        v = ws.cell(r, 1).value
+        cell = ws.cell(r, 1)
+        v = cell.value
         if isinstance(v, dt.datetime):
             v = v.date()
         if isinstance(v, dt.date):
-            if v == day:
-                ws.cell(r, 1).number_format = date_format
-                return r
+            # Force-normalize format on every existing Date cell
+            cell.number_format = date_format
+            if v == day and match_row is None:
+                match_row = r
             last_data_row = r
+
+    if match_row is not None:
+        return match_row
 
     r = last_data_row + 1
     ws.cell(r, 1).value = day
@@ -764,14 +781,9 @@ def main() -> None:
     row = find_or_create_row(ws, day, date_format)
 
     log(f"Writing metrics into row {row}...")
-    # A Date
-    # B Issues Triaged
-    # C Issues Resolved
-    # D PRs Created
-    # E PRs Merged
-    # F Commits
-    # G Open Issues
-    # H Open PRs
+    # A Date | B Issues Triaged | C Issues Resolved | D PRs Created
+    # E PRs Merged | F Commits  | G Open Issues     | H Open PRs
+    # (I Release, J Notes are manual — never touched)
     ws.cell(row, 2).value = metrics["issues_triaged"]
     ws.cell(row, 3).value = metrics["issues_resolved"]
     ws.cell(row, 4).value = metrics["prs_created"]

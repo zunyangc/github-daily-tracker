@@ -16,8 +16,8 @@ HEADERS: List[str] = [
     "Commits",
     "Open Issues",
     "Open PRs",
-    "Release",
-    "Notes",
+    "Release",       # manual
+    "Notes",         # manual
 ]
 
 
